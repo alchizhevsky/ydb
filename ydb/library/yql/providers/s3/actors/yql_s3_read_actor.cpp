@@ -1,3 +1,4 @@
+#include "parquet/statistics.h"
 #include <util/system/platform.h>
 #if defined(_linux_) || defined(_darwin_)
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeArray.h>
@@ -251,10 +252,26 @@ void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSyste
         inflightCounter);
 }
 
+struct TParquetColumnStats {
+    bool HasMinMax = false;
+    parquet::Type::type Type;
+    double Min = INFINITY;
+    double Max = -1 * INFINITY;
+};
+
 struct TParquetFileInfo {
     ui64 RowCount = 0;
     ui64 CompressedSize = 0;
     ui64 UncompressedSize = 0;
+    std::vector <TParquetColumnStats> ColumnStats;
+};
+
+struct TParquetDatasetInfo {
+    parquet::SchemaDescriptor schema;
+    std::vector <TParquetColumnStats> ColumnStats;
+
+    ui64 TotalCompressedSize = 0;
+    ui64 TotalUncompressedSize = 0;
 };
 
 class TS3ReadCoroImpl : public TActorCoroImpl {
@@ -591,7 +608,101 @@ public:
         return arrow::Buffer::FromString(data);
     }
 
-    void RunCoroBlockArrowParserOverHttp() {
+    TParquetFileInfo getFileStatsFromMeta(const std::shared_ptr<parquet::FileMetaData> fileMetadata) {
+        TParquetFileInfo stats;
+
+        stats.RowCount = fileMetadata->num_rows();
+        stats.ColumnStats = std::vector <TParquetColumnStats> (fileMetadata->num_columns());
+
+        for (int rowGroupIndex = 0; rowGroupIndex < fileMetadata->num_row_groups(); ++rowGroupIndex) {
+            const auto rgm = fileMetadata->RowGroup(rowGroupIndex);
+            for (int columnInd = 0; columnInd < rgm->num_columns(); ++columnInd) {
+                stats.UncompressedSize += rgm->ColumnChunk(columnInd)->total_uncompressed_size();
+                stats.CompressedSize += rgm->ColumnChunk(columnInd)->total_compressed_size();
+
+                if (const auto сolumnChunkStatsPtr = rgm->ColumnChunk(columnInd)->statistics()) {
+                    parquet::Type::type physicalType = rgm->schema()->Column(columnInd)->physical_type();
+                    stats.ColumnStats[columnInd].Type = physicalType;
+
+                    const auto columnChunkStats = сolumnChunkStatsPtr.get();
+
+                    if (!columnChunkStats->HasMinMax()){
+                        continue;
+                    }
+
+                    stats.ColumnStats[columnInd].HasMinMax = true;
+
+                    switch (physicalType) {
+                        case parquet::Type::INT32: {
+                            const parquet::TypedStatistics<arrow::Int32Type>* typedStatistics =
+                                static_cast<const parquet::TypedStatistics<arrow::Int32Type>*>(columnChunkStats);
+                            stats.ColumnStats[columnInd].Min = std::min(
+                                stats.ColumnStats[columnInd].Min,
+                                (double)typedStatistics->min()
+                            );
+                            stats.ColumnStats[columnInd].Max = std::max(
+                                stats.ColumnStats[columnInd].Max,
+                                (double)typedStatistics->max()
+                            );
+                            break;
+                        }
+                        case parquet::Type::INT64: {
+                            const parquet::TypedStatistics<arrow::Int64Type>* typedStatistics =
+                                static_cast<const parquet::TypedStatistics<arrow::Int64Type>*>(columnChunkStats);
+                            stats.ColumnStats[columnInd].Min = std::min(
+                                stats.ColumnStats[columnInd].Min,
+                                (double)typedStatistics->min()
+                            );
+                            stats.ColumnStats[columnInd].Max = std::max(
+                            stats.ColumnStats[columnInd].Max,
+                                (double)typedStatistics->max()
+                            );
+                            break;
+                        }
+                        case parquet::Type::FLOAT: {
+                            const parquet::TypedStatistics<arrow::FloatType>* typedStatistics =
+                                static_cast<const parquet::TypedStatistics<arrow::FloatType>*>(columnChunkStats);
+                            stats.ColumnStats[columnInd].Min = std::min(
+                                stats.ColumnStats[columnInd].Min,
+                                (double)typedStatistics->min()
+                            );
+                            stats.ColumnStats[columnInd].Max = std::max(
+                                stats.ColumnStats[columnInd].Max,
+                                (double)typedStatistics->max()
+                            );
+                            break;
+                        }
+                        case parquet::Type::DOUBLE: {
+                            const parquet::TypedStatistics<arrow::DoubleType>* typedStatistics =
+                                static_cast<const parquet::TypedStatistics<arrow::DoubleType>*>(columnChunkStats);
+                            stats.ColumnStats[columnInd].Min = std::min(
+                                stats.ColumnStats[columnInd].Min,
+                                typedStatistics->min()
+                            );
+                            stats.ColumnStats[columnInd].Max = std::max(
+                            stats.ColumnStats[columnInd].Max,
+                                typedStatistics->max()
+                            );
+                            break;
+                        }
+
+                        //todo
+                        case parquet::Type::INT96: //deprecated
+                        case parquet::Type::UNDEFINED:
+                        case parquet::Type::BYTE_ARRAY:
+                        case parquet::Type::FIXED_LEN_BYTE_ARRAY:
+                        case parquet::Type::BOOLEAN:
+                            stats.ColumnStats[columnInd].HasMinMax = false;
+                            break;
+                    }
+                }
+            }
+        }
+
+        return std::move(stats);
+    }
+
+    void RunCoroBlockArrowParserOverHttp(TParquetFileInfo &stats) {
 
         LOG_CORO_D("RunCoroBlockArrowParserOverHttp");
 
@@ -611,6 +722,8 @@ public:
         THROW_ARROW_NOT_OK(builder.Open(std::make_shared<THttpRandomAccessFile>(this, RetryStuff->SizeLimit)));
         THROW_ARROW_NOT_OK(builder.Build(&readers[0]));
         auto fileMetadata = readers[0]->parquet_reader()->metadata();
+
+        stats = getFileStatsFromMeta(fileMetadata);
 
         bool hasPredicate = ReadSpec->Predicate.payload_case() != NYql::NConnector::NApi::TPredicate::PayloadCase::PAYLOAD_NOT_SET;
         auto matchedRowGroups = hasPredicate ? MatchedRowGroups(fileMetadata, ReadSpec->Predicate) : TVector<ui64>();
@@ -754,7 +867,7 @@ public:
                 if (isCancelled) {
                     LOG_CORO_D("RunCoroBlockArrowParserOverHttp - STOPPED ON SATURATION, downloaded " <<
                                SourceContext->GetDownloadedBytes() << " bytes");
-                    break;        
+                    break;
                 }
             }
         }
@@ -986,13 +1099,15 @@ public:
         const ::NMonitoring::TDynamicCounters::TCounterPtr& deferredQueueSize,
         const ::NMonitoring::TDynamicCounters::TCounterPtr& httpInflightSize,
         const ::NMonitoring::TDynamicCounters::TCounterPtr& httpDataRps,
-        const ::NMonitoring::TDynamicCounters::TCounterPtr& rawInflightSize)
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& rawInflightSize,
+        std::shared_ptr<std::unordered_map<TString, TParquetDatasetInfo>> statsByDir)
         : TActorCoroImpl(256_KB), ReadActorFactoryCfg(readActorFactoryCfg), InputIndex(inputIndex),
         TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId),
         PathIndex(pathIndex), Path(path), Url(url), RowsRemained(maxRows),
         SourceContext(queueBufferCounter),
         DeferredQueueSize(deferredQueueSize), HttpInflightSize(httpInflightSize),
-        HttpDataRps(httpDataRps), RawInflightSize(rawInflightSize) {
+        HttpDataRps(httpDataRps), RawInflightSize(rawInflightSize),
+        StatsByDir(statsByDir) {
     }
 
     ~TS3ReadCoroImpl() override {
@@ -1056,7 +1171,36 @@ private:
                         if (Url.StartsWith("file://")) {
                             RunCoroBlockArrowParserOverFile();
                         } else {
-                            RunCoroBlockArrowParserOverHttp();
+                            TParquetFileInfo fileInfo;
+                            RunCoroBlockArrowParserOverHttp(fileInfo);
+
+                            TString dirPath = Path.substr(0, Path.find_last_of('/'));
+                            auto dirIter = StatsByDir->find(dirPath);
+
+                            if (dirIter == StatsByDir->end()) {
+                                dirIter = StatsByDir->insert({dirPath, TParquetDatasetInfo{}}).first;
+                                dirIter->second.ColumnStats = std::vector<TParquetColumnStats>(
+                                    fileInfo.ColumnStats.size()
+                                );
+                            }
+
+                            dirIter->second.TotalUncompressedSize += fileInfo.UncompressedSize;
+                            dirIter->second.TotalCompressedSize += fileInfo.CompressedSize;
+
+                            for (size_t i = 0; i < fileInfo.ColumnStats.size(); ++i) {
+                                dirIter->second.ColumnStats[i].Type = fileInfo.ColumnStats[i].Type;
+                                if (fileInfo.ColumnStats[i].HasMinMax) {
+                                    dirIter->second.ColumnStats[i].HasMinMax = true;
+                                    dirIter->second.ColumnStats[i].Min = std::min(
+                                        dirIter->second.ColumnStats[i].Min,
+                                        fileInfo.ColumnStats[i].Min
+                                    );
+                                    dirIter->second.ColumnStats[i].Max = std::max(
+                                        dirIter->second.ColumnStats[i].Max,
+                                        fileInfo.ColumnStats[i].Max
+                                    );
+                                }
+                            }
                         }
                     } catch (const parquet::ParquetException& ex) {
                         Issues.AddIssue(TIssue(ex.what()));
@@ -1171,6 +1315,7 @@ private:
     const ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightSize;
     const ::NMonitoring::TDynamicCounters::TCounterPtr HttpDataRps;
     const ::NMonitoring::TDynamicCounters::TCounterPtr RawInflightSize;
+    std::shared_ptr<std::unordered_map <TString, TParquetDatasetInfo>> StatsByDir;
 };
 
 class TS3ReadCoroActor : public TActorCoro {
@@ -1263,6 +1408,58 @@ public:
             RawInflightSize = TaskCounters->GetCounter("RawInflightSize");
         }
         IngressStats.Level = statsLevel;
+
+        StatsByDir = std::make_shared<std::unordered_map<TString, TParquetDatasetInfo>>();
+    }
+
+    ~TS3StreamReadActor() {
+        auto tmp = TStringBuilder();
+
+        for (const auto& it : *StatsByDir) {
+            tmp << it.first << ":\nTotalUncompressedSize = " << it.second.TotalUncompressedSize
+                << ", TotalSizeUsed = " << it.second.TotalCompressedSize << "\n----------\n";
+            for (const auto& column : it.second.ColumnStats) {
+                switch (column.Type) {
+                    case parquet::Type::INT32:
+                        tmp << "INT32";
+                        break;
+                    case parquet::Type::INT64:
+                        tmp << "INT64";
+                        break;
+                    case parquet::Type::INT96:
+                        tmp << "INT96";
+                        break;
+                    case parquet::Type::BOOLEAN:
+                        tmp << "BOOLEAN";
+                        break;
+                     case parquet::Type::FIXED_LEN_BYTE_ARRAY:
+                        tmp << "FIXED_LEN_BYTE_ARRAY";
+                        break;
+                    case parquet::Type::BYTE_ARRAY:
+                        tmp << "BYTE_ARRAY";
+                        break;
+                    case parquet::Type::DOUBLE:
+                        tmp << "DOUBLE";
+                        break;
+                    case parquet::Type::FLOAT:
+                        tmp << "FLOAT";
+                        break;
+                    case parquet::Type::UNDEFINED:
+                        tmp << "UNDEFINED";
+                        break;
+
+                }
+                tmp << " MinMax";
+                if (column.HasMinMax) {
+                    tmp << ": {" << column.Min << ", " << column.Max << "};\n";
+                } else {
+                    tmp << ": {_, _};\n";
+                }
+            }
+            tmp << "----------\n\n";
+        }
+
+        std::cout << tmp;
     }
 
     void Bootstrap() {
@@ -1352,7 +1549,7 @@ public:
         if (ReadSpec->ParallelDownloadCount && splitCount >= ReadSpec->ParallelDownloadCount) {
             // explicit limit
             return false;
-        } 
+        }
         if (splitCount && DownloadSize * SourceContext->Ratio() > ReadActorFactoryCfg.DataInflight * 2) {
             // dynamic limit
             return false;
@@ -1399,7 +1596,8 @@ public:
             DeferredQueueSize,
             HttpInflightSize,
             HttpDataRps,
-            RawInflightSize
+            RawInflightSize,
+            this->StatsByDir
         );
         if (AsyncDecoding) {
             actorId = Register(new TS3ReadCoroActor(std::move(impl)));
@@ -1709,7 +1907,7 @@ private:
             }
         }
     }
-    
+
     void Handle(TEvS3Provider::TEvAck::TPtr& ev) {
         FileQueueEvents.OnEventReceived(ev);
     }
@@ -1825,6 +2023,8 @@ private:
     bool IsConfirmedFileQueueFinish = false;
     TRetryEventsQueue FileQueueEvents;
     TDeque<TVector<NS3::FileQueue::TObjectPath>> PathBatchQueue;
+
+    std::shared_ptr<std::unordered_map<TString, TParquetDatasetInfo>> StatsByDir;
 };
 
 using namespace NKikimr::NMiniKQL;
