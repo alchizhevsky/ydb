@@ -261,15 +261,16 @@ struct TParquetColumnStats {
 
 struct TParquetFileInfo {
     ui64 RowCount = 0;
+    parquet::SchemaDescriptor Schema;
     ui64 CompressedSize = 0;
     ui64 UncompressedSize = 0;
     std::vector <TParquetColumnStats> ColumnStats;
 };
 
 struct TParquetDatasetInfo {
-    parquet::SchemaDescriptor schema;
+    ui64 RowCount = 0;
+    parquet::SchemaDescriptor Schema;
     std::vector <TParquetColumnStats> ColumnStats;
-
     ui64 TotalCompressedSize = 0;
     ui64 TotalUncompressedSize = 0;
 };
@@ -613,6 +614,7 @@ public:
 
         stats.RowCount = fileMetadata->num_rows();
         stats.ColumnStats = std::vector <TParquetColumnStats> (fileMetadata->num_columns());
+        stats.Schema = *fileMetadata->schema();
 
         for (int rowGroupIndex = 0; rowGroupIndex < fileMetadata->num_row_groups(); ++rowGroupIndex) {
             const auto rgm = fileMetadata->RowGroup(rowGroupIndex);
@@ -699,7 +701,7 @@ public:
             }
         }
 
-        return std::move(stats);
+        return stats;
     }
 
     void RunCoroBlockArrowParserOverHttp(TParquetFileInfo &stats) {
@@ -1182,10 +1184,12 @@ private:
                                 dirIter->second.ColumnStats = std::vector<TParquetColumnStats>(
                                     fileInfo.ColumnStats.size()
                                 );
+                                dirIter->second.Schema = fileInfo.Schema;
                             }
 
                             dirIter->second.TotalUncompressedSize += fileInfo.UncompressedSize;
                             dirIter->second.TotalCompressedSize += fileInfo.CompressedSize;
+                            dirIter->second.RowCount += fileInfo.RowCount;
 
                             for (size_t i = 0; i < fileInfo.ColumnStats.size(); ++i) {
                                 dirIter->second.ColumnStats[i].Type = fileInfo.ColumnStats[i].Type;
@@ -1417,7 +1421,11 @@ public:
 
         for (const auto& it : *StatsByDir) {
             tmp << it.first << ":\nTotalUncompressedSize = " << it.second.TotalUncompressedSize
-                << ", TotalSizeUsed = " << it.second.TotalCompressedSize << "\n----------\n";
+                << ", TotalSizeUsed = " << it.second.TotalCompressedSize
+                << "\nRowCount = " << it.second.RowCount
+                << "\nSchema: " << it.second.Schema.ToString()
+                << "\n----------\n";
+
             for (const auto& column : it.second.ColumnStats) {
                 switch (column.Type) {
                     case parquet::Type::INT32:
